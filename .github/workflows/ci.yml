@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main, develop]
+
+# Minimum coverage on core logic (the course asks for 60%).
+env:
+  MIN_COVERAGE: 60
+
+jobs:
+  check:
+    name: Analyze, test, coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Always runs, even before the Flutter project exists.
+      - name: Block hardcoded secrets
+        run: |
+          if grep -rEn --include='*.dart' --include='*.json' --include='*.yaml' --include='*.xml' \
+            -e 'AIza[0-9A-Za-z_-]{35}' -e 'sk-[A-Za-z0-9]{20,}' -e 'sk-ant-[A-Za-z0-9_-]{20,}' . ; then
+            echo "A possible API key is in the code. Move it to a secret."
+            exit 1
+          fi
+
+      # The Flutter steps wait until the project exists (pubspec.yaml), so the first commits are not red.
+      - name: Note when there is no Flutter project yet
+        if: hashFiles('pubspec.yaml') == ''
+        run: echo "No pubspec.yaml yet. Flutter checks are skipped until the project is created."
+
+      - uses: subosito/flutter-action@v2
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+        if: hashFiles('pubspec.yaml') != ''
+      - run: dart format --output=none --set-exit-if-changed .
+        if: hashFiles('pubspec.yaml') != ''
+      - run: flutter analyze
+        if: hashFiles('pubspec.yaml') != ''
+      - run: flutter test --coverage
+        if: hashFiles('pubspec.yaml') != ''
+
+      - name: Check coverage
+        if: hashFiles('pubspec.yaml') != ''
+        run: |
+          sudo apt-get install -y lcov > /dev/null
+          # Leave out generated code so it does not skew the number.
+          lcov --remove coverage/lcov.info '*.g.dart' '*.freezed.dart' 'lib/generated/*' \
+            -o coverage/lcov.clean.info --quiet
+          PCT=$(lcov --summary coverage/lcov.clean.info 2>&1 | grep -o 'lines.*: [0-9.]*' | grep -o '[0-9.]*$')
+          echo "Line coverage: ${PCT}%"
+          awk "BEGIN { exit !(${PCT} >= ${MIN_COVERAGE}) }" || { echo "Coverage is below ${MIN_COVERAGE}%"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          name: coverage
+          path: coverage/lcov.clean.info
+
+  build-apk:
+    name: Build APK
+    needs: check
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: subosito/flutter-action@v2
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          channel: stable
+          cache: true
+      - run: flutter pub get
+        if: hashFiles('pubspec.yaml') != ''
+      # Keys are passed at build time from repo secrets. Never commit them.
+      - run: flutter build apk --release --dart-define=AI_PROXY_URL=${{ secrets.AI_PROXY_URL }}
+        if: hashFiles('pubspec.yaml') != ''
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('pubspec.yaml') != ''
+        with:
+          name: app-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
